@@ -12,8 +12,6 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.listMessages = listMessages;
-exports.getMessageDetails = getMessageDetails;
 const express_1 = __importDefault(require("express"));
 const googleapis_1 = require("googleapis");
 const app = (0, express_1.default)();
@@ -26,8 +24,8 @@ const oauth2Client = new googleapis_1.google.auth.OAuth2(CLIENT_ID, CLIENT_SECRE
 const SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/userinfo.email", // Add user info scope
-    "https://www.googleapis.com/auth/userinfo.profile" // Add profile info scope
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile"
 ];
 app.get("/auth", (req, res) => {
     const authUrl = oauth2Client.generateAuthUrl({
@@ -38,14 +36,15 @@ app.get("/auth", (req, res) => {
 });
 app.get('/oauth2callback/google-callback', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const code = req.query.code;
-    console.log(code);
     try {
         const { tokens } = yield oauth2Client.getToken(code);
-        console.log(tokens);
         oauth2Client.setCredentials(tokens);
         const userInfo = yield getUserInfo();
-        console.log(userInfo); // Log user info to verify
         res.send(`Authentication successful! You can close this tab. User ID: ${userInfo.id}, Email: ${userInfo.email}`);
+        // cron.schedule('*/1 * * * *', () => {
+        //   console.log('Checking emails and sending replies every 2 minutes...');
+        //   checkEmailsAndSendReplies();
+        // });
     }
     catch (error) {
         console.error('Error getting access token:', error);
@@ -67,6 +66,7 @@ function listMessages() {
         const gmail = googleapis_1.google.gmail({ version: "v1", auth: oauth2Client });
         const res = yield gmail.users.messages.list({
             userId: "me",
+            q: "is:unread",
             maxResults: 10,
         });
         return res.data.messages || [];
@@ -79,29 +79,88 @@ function getMessageDetails(messageId) {
             userId: "me",
             id: messageId,
         });
+        console.log("message details are -- >", msg.data);
         return msg.data;
+    });
+}
+const repliedMessages = new Set();
+function createReplyRaw(from, to, subject) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const emailContent = `From: ${from}\nTo: ${to}\nSubject: ${subject}\n\nThank you for your message. I am unavailable right now, but will respond as soon as possible...`;
+        const base64EncodedEmail = Buffer.from(emailContent)
+            .toString("base64")
+            .replace(/\+/g, "-")
+            .replace(/\//g, "_");
+        return base64EncodedEmail;
+    });
+}
+function checkEmailsAndSendReplies() {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j;
+        try {
+            const gmail = googleapis_1.google.gmail({ version: "v1", auth: oauth2Client });
+            const messages = yield listMessages();
+            console.log(messages);
+            if (messages && messages.length > 0) {
+                for (const message of messages) {
+                    if (!message.id) {
+                        continue;
+                    }
+                    const email = yield getMessageDetails(message.id);
+                    const from = (_c = (_b = (_a = email.payload) === null || _a === void 0 ? void 0 : _a.headers) === null || _b === void 0 ? void 0 : _b.find((header) => header.name === "From")) === null || _c === void 0 ? void 0 : _c.value;
+                    const toEmail = (_f = (_e = (_d = email.payload) === null || _d === void 0 ? void 0 : _d.headers) === null || _e === void 0 ? void 0 : _e.find((header) => header.name === "To")) === null || _f === void 0 ? void 0 : _f.value;
+                    const subject = (_j = (_h = (_g = email.payload) === null || _g === void 0 ? void 0 : _g.headers) === null || _h === void 0 ? void 0 : _h.find((header) => header.name === "Subject")) === null || _j === void 0 ? void 0 : _j.value;
+                    if (!from || !toEmail || !subject) {
+                        continue;
+                    }
+                    if (repliedMessages.has(message.id)) {
+                        continue;
+                    }
+                    const thread = yield gmail.users.threads.get({
+                        userId: "me",
+                        id: message.threadId,
+                    });
+                    const replies = thread.data.messages.slice(1);
+                    if (replies.length === 0) {
+                        yield gmail.users.messages.send({
+                            userId: "me",
+                            requestBody: {
+                                raw: yield createReplyRaw(toEmail, from, subject),
+                            },
+                        });
+                        repliedMessages.add(message.id);
+                    }
+                }
+            }
+        }
+        catch (error) {
+            console.error("Error occurred:", error);
+        }
     });
 }
 app.get("/emails", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const messages = yield listMessages(); // Assuming listMessages() correctly fetches message IDs
+        const messages = yield listMessages();
         const emailPromises = messages === null || messages === void 0 ? void 0 : messages.map((message) => __awaiter(void 0, void 0, void 0, function* () {
             var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
+            if (!message.id) {
+                return null;
+            }
             const emailDetails = yield getMessageDetails(message.id);
             let sender = "";
             let subject = "";
             let date = "";
-            (_b = (_a = emailDetails.payload) === null || _a === void 0 ? void 0 : _a.headers) === null || _b === void 0 ? void 0 : _b.map((header) => __awaiter(void 0, void 0, void 0, function* () {
+            (_b = (_a = emailDetails.payload) === null || _a === void 0 ? void 0 : _a.headers) === null || _b === void 0 ? void 0 : _b.forEach((header) => {
                 if (header.name === "From") {
-                    sender = header.value || sender; // Assign sender if header.value exists
+                    sender = header.value || sender;
                 }
                 if (header.name === "Subject") {
-                    subject = header.value || subject; // Assign subject if header.value exists
+                    subject = header.value || subject;
                 }
                 if (header.name === "Date") {
-                    date = header.value || date; // Assign date if header.value exists
+                    date = header.value || date;
                 }
-            }));
+            });
             const messageHTML = (_f = (_e = (_d = (_c = emailDetails.payload) === null || _c === void 0 ? void 0 : _c.parts) === null || _d === void 0 ? void 0 : _d[1]) === null || _e === void 0 ? void 0 : _e.body) === null || _f === void 0 ? void 0 : _f.data;
             const messageTEXT = (_k = (_j = (_h = (_g = emailDetails.payload) === null || _g === void 0 ? void 0 : _g.parts) === null || _h === void 0 ? void 0 : _h[0]) === null || _j === void 0 ? void 0 : _j.body) === null || _k === void 0 ? void 0 : _k.data;
             const email = {
@@ -114,7 +173,7 @@ app.get("/emails", (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             };
             return email;
         }));
-        const emails = yield Promise.all(emailPromises);
+        const emails = (yield Promise.all(emailPromises)).filter(email => email !== null);
         res.json(emails);
     }
     catch (error) {
@@ -131,52 +190,6 @@ function decodeBase64(encodedString) {
         console.error('Error decoding Base64:', error);
         return null;
     }
-}
-app.get('/webhook', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    try {
-        const gmail = googleapis_1.google.gmail({ version: 'v1', auth: oauth2Client });
-        const response = yield gmail.users.watch({
-            userId: 'me',
-            requestBody: {
-                topicName: 'projects/mailer-427505/topics/mailr_3241',
-                labelIds: ['INBOX'], // You can filter based on labels if needed
-                labelFilterBehavior: 'INCLUDE',
-            },
-        });
-        console.log('Watch response:', response.data);
-        res.status(200).send('Webhook set up successfully');
-    }
-    catch (error) {
-        console.error('Error setting up webhook:', error);
-        res.status(500).send('Error setting up webhook');
-    }
-}));
-app.post('/webhook', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const message = req.body;
-    console.log(message); // Extract message field from the request body
-    if (message && message.data) {
-        const data = Buffer.from(message.data, 'base64').toString('utf-8');
-        const notification = JSON.parse(data);
-        console.log('Received notification:', notification);
-        // Here you can handle the notification as needed, such as fetching updated messages
-        // Acknowledge the notification
-        res.status(200).send('Notification received');
-    }
-    else {
-        console.error('Invalid notification received:', req.body);
-        res.status(400).send('Invalid notification format');
-    }
-}));
-function getHistory(sinceHistoryId) {
-    return __awaiter(this, void 0, void 0, function* () {
-        const gmail = googleapis_1.google.gmail({ version: 'v1', auth: oauth2Client });
-        const response = yield gmail.users.history.list({
-            userId: 'me',
-            startHistoryId: sinceHistoryId,
-            historyTypes: ['messageAdded', 'messageDeleted']
-        });
-        console.log(response.data.history || []);
-    });
 }
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
