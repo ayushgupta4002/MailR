@@ -24,8 +24,8 @@ This project provides an automated email processing system that integrates with 
 
 1. **Clone the repository**:
     ```sh
-    git clone https://github.com/your-repo/email-automation-system.git
-    cd email-automation-system
+    git clone https://github.com/ayushgupta4002/MailR.git
+    cd MailR
     ```
 
 2. **Install dependencies**:
