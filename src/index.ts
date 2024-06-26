@@ -1,13 +1,17 @@
 import express, { Request, Response } from "express";
 import { gmail_v1, google } from "googleapis";
-import cron from 'node-cron';
+import cron from "node-cron";
+import OpenAI from "openai";
 
 const app = express();
 const PORT = 5000;
-require('dotenv').config();
+require("dotenv").config();
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const REDIRECT_URI = "http://localhost:5000/oauth2callback/google-callback";
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 const oauth2Client = new google.auth.OAuth2(
   CLIENT_ID,
@@ -19,7 +23,7 @@ const SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/userinfo.email",
-  "https://www.googleapis.com/auth/userinfo.profile"
+  "https://www.googleapis.com/auth/userinfo.profile",
 ];
 
 app.get("/auth", (req: Request, res: Response) => {
@@ -30,51 +34,43 @@ app.get("/auth", (req: Request, res: Response) => {
   res.redirect(authUrl);
 });
 
-app.get('/oauth2callback/google-callback', async (req: Request, res: Response) => {
-  const code = req.query.code as string;
-  try {
+app.get(
+  "/oauth2callback/google-callback",
+  async (req: Request, res: Response) => {
+    const code = req.query.code as string;
+    try {
       const { tokens } = await oauth2Client.getToken(code);
       oauth2Client.setCredentials(tokens);
       const userInfo = await getUserInfo();
-      res.send(`Authentication successful! You can close this tab. User ID: ${userInfo.id}, Email: ${userInfo.email}`);
-      // cron.schedule('*/1 * * * *', () => {
-      //   console.log('Checking emails and sending replies every 2 minutes...');
-      //   checkEmailsAndSendReplies();
-      // });
-      
-
-  } catch (error) {
-    console.error('Error getting access token:', error);
-    res.status(500).send('Error getting access token');
+      res.send(
+        `Authentication successful! You can close this tab. User ID: ${userInfo.id}, Email: ${userInfo.email}`
+      );
+      cron.schedule("*/1 * * * *", () => {
+        console.log("Checking emails and sending replies every 2 minutes...");
+        checkEmailsAndSendReplies();
+      });
+    } catch (error) {
+      console.error("Error getting access token:", error);
+      res.status(500).send("Error getting access token");
+    }
   }
-});
+);
 
 async function getUserInfo() {
-  const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+  const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
   const userInfoResponse = await oauth2.userinfo.get();
   return {
     id: userInfoResponse.data.id,
-    email: userInfoResponse.data.email
+    email: userInfoResponse.data.email,
   };
 }
-
-
-
-
-
-
-
-
-
-
-
 
 async function listMessages(): Promise<gmail_v1.Schema$Message[]> {
   const gmail = google.gmail({ version: "v1", auth: oauth2Client });
   const res = await gmail.users.messages.list({
     userId: "me",
-    q: "is:unread",
-    maxResults: 10,
+    q: "-in:chat -from:me is:unread",
+    maxResults: 2,
   });
   return res.data.messages || [];
 }
@@ -87,18 +83,55 @@ async function getMessageDetails(
     userId: "me",
     id: messageId,
   });
-  console.log("message details are -- >",msg.data);
+  // console.log("message details are -- >",msg.data);
 
   return msg.data;
 }
 
+async function createLabelIfNeeded(labelName: string) {
+  const gmail = google.gmail({ version: "v1", auth: oauth2Client });
+  const res = await gmail.users.labels.list({ userId: "me" });
+  const labels = res.data.labels;
 
+  const existingLabel = labels?.find((label) => label.name === labelName);
+  if (existingLabel) {
+    return existingLabel.id;
+  }
 
+  const newLabel = await gmail.users.labels.create({
+    userId: "me",
+    requestBody: {
+      name: labelName,
+      labelListVisibility: "labelShow",
+      messageListVisibility: "show",
+    },
+  });
+
+  return newLabel.data.id;
+}
 
 const repliedMessages = new Set<string>();
 
-async function createReplyRaw(from: string, to: string, subject: string) {
-  const emailContent = `From: ${from}\nTo: ${to}\nSubject: ${subject}\n\nThank you for your message. I am unavailable right now, but will respond as soon as possible...`;
+async function createReplyRaw(from: string, to: string, subject: string , SenderMessage:string) {
+  let replyMessage;
+  if(SenderMessage){
+    const completion = await openai.chat.completions.create({
+      messages: [
+        {
+          role: "system",
+          content: `${SenderMessage} This is an email that I received, analyze this email content and write a brief and crisp reply to this email in excellent english with professionalism, just return me the text and nothing else , if it has different lines seperate them , you can use this as an example "Hi sir \nToday is nice\n\n"`,
+        },
+      ],
+      model: "gpt-3.5-turbo",
+    });
+    replyMessage= completion.choices[0].message.content
+  }else{
+    replyMessage="Thank you for your message. I am unavailable right now, but will respond as soon as possible..."
+  }
+  console.log(replyMessage);
+
+  
+  const emailContent = `From: ${from}\nTo: ${to}\nSubject: ${subject}\n\n ${replyMessage} `;
   const base64EncodedEmail = Buffer.from(emailContent)
     .toString("base64")
     .replace(/\+/g, "-")
@@ -113,7 +146,6 @@ async function checkEmailsAndSendReplies() {
     const messages = await listMessages();
     console.log(messages);
 
-
     if (messages && messages.length > 0) {
       for (const message of messages) {
         if (!message.id) {
@@ -121,16 +153,25 @@ async function checkEmailsAndSendReplies() {
         }
 
         const email = await getMessageDetails(message.id);
-        const from = email.payload?.headers?.find((header) => header.name === "From")?.value;
-        const toEmail = email.payload?.headers?.find((header) => header.name === "To")?.value;
-        const subject = email.payload?.headers?.find((header) => header.name === "Subject")?.value;
-
+        const from = email.payload?.headers?.find(
+          (header) => header.name === "From"
+        )?.value;
+        const toEmail = email.payload?.headers?.find(
+          (header) => header.name === "To"
+        )?.value;
+        const subject = email.payload?.headers?.find(
+          (header) => header.name === "Subject"
+        )?.value;
+        const messageTEXT = email.payload?.parts?.[0]?.body?.data;
 
         if (!from || !toEmail || !subject) {
           continue;
         }
 
         if (repliedMessages.has(message.id)) {
+          continue;
+        }
+        if(!messageTEXT){
           continue;
         }
 
@@ -145,32 +186,46 @@ async function checkEmailsAndSendReplies() {
           await gmail.users.messages.send({
             userId: "me",
             requestBody: {
-              raw: await createReplyRaw(toEmail, from, subject),
+              raw: await createReplyRaw(toEmail, from, subject ,messageTEXT),
             },
           });
+          console.log("sending reply to " + from);
 
-        
+          const label1 = "Interested";
+          const labe2 = "Not Interested";
+          const label3 = "More Information";
+          const completion = await openai.chat.completions.create({
+            messages: [
+              {
+                role: "system",
+                content: `${messageTEXT} This is an email that I received, analyze this email content and assign a label to it out of these 3 : {Interested,Not Interested,More Information} , return only one of these as reply and nothing other than this`,
+              },
+            ],
+            model: "gpt-3.5-turbo",
+          });
 
-          repliedMessages.add(message.id);        }
+          console.log(completion.choices[0].message.content);
+          const label = completion.choices[0].message.content;
+          const labelId = await createLabelIfNeeded(label || "Label");
+
+          if (labelId) {
+            await gmail.users.messages.modify({
+              userId: "me",
+              id: message.id,
+              requestBody: {
+                addLabelIds: [labelId],
+              },
+            });
+          }
+
+          repliedMessages.add(message.id);
+        }
       }
     }
   } catch (error) {
     console.error("Error occurred:", error);
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 app.get("/emails", async (req: Request, res: Response) => {
   try {
@@ -204,14 +259,16 @@ app.get("/emails", async (req: Request, res: Response) => {
         sender: sender || "unknown sender",
         subject: subject || "No Subject",
         date: date || "",
-        messageHTML: messageHTML && decodeBase64(messageHTML) || "No Message",
-        messageTEXT: messageTEXT && decodeBase64(messageTEXT) || "No Message",
+        messageHTML: (messageHTML && decodeBase64(messageHTML)) || "No Message",
+        messageTEXT: (messageTEXT && decodeBase64(messageTEXT)) || "No Message",
       };
 
       return email;
     });
 
-    const emails = (await Promise.all(emailPromises)).filter(email => email !== null);
+    const emails = (await Promise.all(emailPromises)).filter(
+      (email) => email !== null
+    );
     res.json(emails);
   } catch (error) {
     console.error("Error retrieving emails:", error);
@@ -220,10 +277,10 @@ app.get("/emails", async (req: Request, res: Response) => {
 });
 function decodeBase64(encodedString: string): string | null {
   try {
-    const buff = Buffer.from(encodedString, 'base64');
-    return buff.toString('utf-8');
+    const buff = Buffer.from(encodedString, "base64");
+    return buff.toString("utf-8");
   } catch (error) {
-    console.error('Error decoding Base64:', error);
+    console.error("Error decoding Base64:", error);
     return null;
   }
 }
