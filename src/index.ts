@@ -2,6 +2,78 @@ import express, { Request, Response } from "express";
 import { gmail_v1, google } from "googleapis";
 import cron from "node-cron";
 import OpenAI from "openai";
+import { Queue } from "bullmq";
+import { Worker } from "bullmq";
+
+const myQueue = new Queue("processQueue", {
+  connection: {
+    host: "127.0.0.1",
+    port: 6379,
+  },
+});
+
+const worker = new Worker(
+  "processQueue",
+  async (job) => {
+    // console.log("this is job : " + job.id);
+    const gmail = google.gmail({ version: "v1", auth: oauth2Client });
+    const toEmail =job.data.emaildata.toEmail
+    const from =job.data.emaildata.from
+    const subject =job.data.emaildata.subject
+    const messageId = job.data.emaildata.messageId
+    const messageText =job.data.emaildata.messageText
+    console.log("received item in queue" + from)
+
+    await gmail.users.messages.send({
+      userId: "me",
+      requestBody: {
+        raw: await createReplyRaw(
+          toEmail,
+          from,
+          subject,
+          messageId,
+          messageText
+        ),
+      },
+    }).then((resp)=>console.log("response is " + resp)).catch((err: any)=> console.log(err));
+
+    console.log("Sending reply to " + from);
+
+    const completion = await openai.chat.completions.create({
+      messages: [
+        {
+          role: "system",
+          content: `${messageText} This is an email that I received, analyze this email content and assign a label to it out of these 3: {Interested, Not Interested, More Information}. Return only one of these as a reply and nothing other than this.`,
+        },
+      ],
+      model: "gpt-3.5-turbo",
+    });
+
+    console.log(completion.choices[0].message.content);
+    const label = completion.choices[0].message.content;
+    const labelId = await createLabelIfNeeded(label || "Label");
+
+    if (labelId) {
+      await gmail.users.messages.modify({
+        userId: "me",
+        id: messageId,
+        requestBody: {
+          addLabelIds: [labelId],
+          removeLabelIds: ["UNREAD"],
+        },
+      });
+    }
+
+    repliedMessages.add(messageId);
+    console.log(job.id + " job completed")
+  },
+  {
+    connection: {
+      host: "127.0.0.1",
+      port: 6379,
+    },
+  }
+);
 
 const app = express();
 const PORT = 5000;
@@ -43,10 +115,10 @@ app.get(
       oauth2Client.setCredentials(tokens);
       const userInfo = await getUserInfo();
       res.send(
-        `Authentication successful! You can close this tab. User ID: ${userInfo.id}, Email: ${userInfo.email}`
+        `Authentication successful! You can close this tab. , Email: ${userInfo.email}`
       );
       cron.schedule("*/1 * * * *", () => {
-        console.log("Checking emails and sending replies every 2 minutes...");
+        console.log("Checking emails and sending replies every 1 minute...");
         checkEmailsAndSendReplies();
       });
     } catch (error) {
@@ -83,8 +155,6 @@ async function getMessageDetails(
     userId: "me",
     id: messageId,
   });
-  // console.log("message details are -- >",msg.data);
-
   return msg.data;
 }
 
@@ -112,30 +182,37 @@ async function createLabelIfNeeded(labelName: string) {
 
 const repliedMessages = new Set<string>();
 
-async function createReplyRaw(from: string, to: string, subject: string , SenderMessage:string) {
+async function createReplyRaw(
+  from: string,
+  to: string,
+  subject: string,
+  messageId: string,
+  messageText: string
+) {
   let replyMessage;
-  if(SenderMessage){
+  if (messageText) {
     const completion = await openai.chat.completions.create({
       messages: [
         {
           role: "system",
-          content: `${SenderMessage} This is an email that I received, analyze this email content and write a brief and crisp reply to this email in excellent english with professionalism, just return me the text and nothing else , if it has different lines seperate them , you can use this as an example "Hi sir \nToday is nice\n\n"`,
+          content: `${messageText} This is an email that I received, analyze this email content and write a brief and crisp reply to this email in excellent English with professionalism. Just return me the text and nothing else and do not include any tages like [your name] or [sender name] etc.The reply should completely in context of email and no extra preassumed text shall be added. If it has different lines, separate them. You can use this as an example: "Hi sir \nToday is nice\n\n"`,
         },
       ],
       model: "gpt-3.5-turbo",
     });
-    replyMessage= completion.choices[0].message.content
-  }else{
-    replyMessage="Thank you for your message. I am unavailable right now, but will respond as soon as possible..."
+    replyMessage = completion.choices[0].message.content;
+  } else {
+    replyMessage =
+      "Thank you for your message. I am unavailable right now, but will respond as soon as possible...";
   }
   console.log(replyMessage);
 
-  
-  const emailContent = `From: ${from}\nTo: ${to}\nSubject: ${subject}\n\n ${replyMessage} `;
+  const emailContent = `From: ${from}\nTo: ${to}\nSubject: Re: ${subject}\nIn-Reply-To: ${messageId}\nReferences: ${messageId}\n\n${replyMessage}`;
   const base64EncodedEmail = Buffer.from(emailContent)
     .toString("base64")
     .replace(/\+/g, "-")
-    .replace(/\//g, "_");
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 
   return base64EncodedEmail;
 }
@@ -162,7 +239,7 @@ async function checkEmailsAndSendReplies() {
         const subject = email.payload?.headers?.find(
           (header) => header.name === "Subject"
         )?.value;
-        const messageTEXT = email.payload?.parts?.[0]?.body?.data;
+        const messageText = email.payload?.parts?.[0]?.body?.data;
 
         if (!from || !toEmail || !subject) {
           continue;
@@ -171,7 +248,7 @@ async function checkEmailsAndSendReplies() {
         if (repliedMessages.has(message.id)) {
           continue;
         }
-        if(!messageTEXT){
+        if (!messageText) {
           continue;
         }
 
@@ -183,42 +260,16 @@ async function checkEmailsAndSendReplies() {
         const replies = thread.data.messages!.slice(1);
 
         if (replies.length === 0) {
-          await gmail.users.messages.send({
-            userId: "me",
-            requestBody: {
-              raw: await createReplyRaw(toEmail, from, subject ,messageTEXT),
-            },
-          });
-          console.log("sending reply to " + from);
-
-          const label1 = "Interested";
-          const labe2 = "Not Interested";
-          const label3 = "More Information";
-          const completion = await openai.chat.completions.create({
-            messages: [
-              {
-                role: "system",
-                content: `${messageTEXT} This is an email that I received, analyze this email content and assign a label to it out of these 3 : {Interested,Not Interested,More Information} , return only one of these as reply and nothing other than this`,
-              },
-            ],
-            model: "gpt-3.5-turbo",
-          });
-
-          console.log(completion.choices[0].message.content);
-          const label = completion.choices[0].message.content;
-          const labelId = await createLabelIfNeeded(label || "Label");
-
-          if (labelId) {
-            await gmail.users.messages.modify({
-              userId: "me",
-              id: message.id,
-              requestBody: {
-                addLabelIds: [labelId],
-              },
-            });
-          }
-
-          repliedMessages.add(message.id);
+          const emaildata = {
+            toEmail: toEmail,
+            from: from,
+            subject : subject,
+            messageText: messageText,
+            messageId: message.id,
+            gmail: gmail,
+          };
+          console.log("adding data to queue" + from)
+          await myQueue.add("SendMessage", { emaildata: emaildata });
         }
       }
     }
@@ -252,7 +303,7 @@ app.get("/emails", async (req: Request, res: Response) => {
       });
 
       const messageHTML = emailDetails.payload?.parts?.[1]?.body?.data;
-      const messageTEXT = emailDetails.payload?.parts?.[0]?.body?.data;
+      const messageText = emailDetails.payload?.parts?.[0]?.body?.data;
 
       const email = {
         id: emailDetails.id,
@@ -260,7 +311,7 @@ app.get("/emails", async (req: Request, res: Response) => {
         subject: subject || "No Subject",
         date: date || "",
         messageHTML: (messageHTML && decodeBase64(messageHTML)) || "No Message",
-        messageTEXT: (messageTEXT && decodeBase64(messageTEXT)) || "No Message",
+        messageText: (messageText && decodeBase64(messageText)) || "No Message",
       };
 
       return email;
@@ -275,6 +326,7 @@ app.get("/emails", async (req: Request, res: Response) => {
     res.status(500).send("Error retrieving emails");
   }
 });
+
 function decodeBase64(encodedString: string): string | null {
   try {
     const buff = Buffer.from(encodedString, "base64");
@@ -284,6 +336,7 @@ function decodeBase64(encodedString: string): string | null {
     return null;
   }
 }
+
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 });

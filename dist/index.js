@@ -16,6 +16,60 @@ const express_1 = __importDefault(require("express"));
 const googleapis_1 = require("googleapis");
 const node_cron_1 = __importDefault(require("node-cron"));
 const openai_1 = __importDefault(require("openai"));
+const bullmq_1 = require("bullmq");
+const bullmq_2 = require("bullmq");
+const myQueue = new bullmq_1.Queue("processQueue", {
+    connection: {
+        host: "127.0.0.1",
+        port: 6379,
+    },
+});
+const worker = new bullmq_2.Worker("processQueue", (job) => __awaiter(void 0, void 0, void 0, function* () {
+    // console.log("this is job : " + job.id);
+    const gmail = googleapis_1.google.gmail({ version: "v1", auth: oauth2Client });
+    const toEmail = job.data.emaildata.toEmail;
+    const from = job.data.emaildata.from;
+    const subject = job.data.emaildata.subject;
+    const messageId = job.data.emaildata.messageId;
+    const messageText = job.data.emaildata.messageText;
+    console.log("received item in queue" + from);
+    yield gmail.users.messages.send({
+        userId: "me",
+        requestBody: {
+            raw: yield createReplyRaw(toEmail, from, subject, messageId, messageText),
+        },
+    }).then((resp) => console.log("response is " + resp)).catch((err) => console.log(err));
+    console.log("Sending reply to " + from);
+    const completion = yield openai.chat.completions.create({
+        messages: [
+            {
+                role: "system",
+                content: `${messageText} This is an email that I received, analyze this email content and assign a label to it out of these 3: {Interested, Not Interested, More Information}. Return only one of these as a reply and nothing other than this.`,
+            },
+        ],
+        model: "gpt-3.5-turbo",
+    });
+    console.log(completion.choices[0].message.content);
+    const label = completion.choices[0].message.content;
+    const labelId = yield createLabelIfNeeded(label || "Label");
+    if (labelId) {
+        yield gmail.users.messages.modify({
+            userId: "me",
+            id: messageId,
+            requestBody: {
+                addLabelIds: [labelId],
+                removeLabelIds: ["UNREAD"],
+            },
+        });
+    }
+    repliedMessages.add(messageId);
+    console.log(job.id + " job completed");
+}), {
+    connection: {
+        host: "127.0.0.1",
+        port: 6379,
+    },
+});
 const app = (0, express_1.default)();
 const PORT = 5000;
 require("dotenv").config();
@@ -45,9 +99,9 @@ app.get("/oauth2callback/google-callback", (req, res) => __awaiter(void 0, void 
         const { tokens } = yield oauth2Client.getToken(code);
         oauth2Client.setCredentials(tokens);
         const userInfo = yield getUserInfo();
-        res.send(`Authentication successful! You can close this tab. User ID: ${userInfo.id}, Email: ${userInfo.email}`);
+        res.send(`Authentication successful! You can close this tab. , Email: ${userInfo.email}`);
         node_cron_1.default.schedule("*/1 * * * *", () => {
-            console.log("Checking emails and sending replies every 2 minutes...");
+            console.log("Checking emails and sending replies every 1 minute...");
             checkEmailsAndSendReplies();
         });
     }
@@ -84,7 +138,6 @@ function getMessageDetails(messageId) {
             userId: "me",
             id: messageId,
         });
-        // console.log("message details are -- >",msg.data);
         return msg.data;
     });
 }
@@ -109,15 +162,15 @@ function createLabelIfNeeded(labelName) {
     });
 }
 const repliedMessages = new Set();
-function createReplyRaw(from, to, subject, SenderMessage) {
+function createReplyRaw(from, to, subject, messageId, messageText) {
     return __awaiter(this, void 0, void 0, function* () {
         let replyMessage;
-        if (SenderMessage) {
+        if (messageText) {
             const completion = yield openai.chat.completions.create({
                 messages: [
                     {
                         role: "system",
-                        content: `${SenderMessage} This is an email that I received, analyze this email content and write a brief and crisp reply to this email in excellent english with professionalism, just return me the text and nothing else , if it has different lines seperate them , you can use this as an example "Hi sir \nToday is nice\n\n"`,
+                        content: `${messageText} This is an email that I received, analyze this email content and write a brief and crisp reply to this email in excellent English with professionalism. Just return me the text and nothing else and do not include any tages like [your name] or [sender name] etc.The reply should completely in context of email and no extra preassumed text shall be added. If it has different lines, separate them. You can use this as an example: "Hi sir \nToday is nice\n\n"`,
                     },
                 ],
                 model: "gpt-3.5-turbo",
@@ -125,14 +178,16 @@ function createReplyRaw(from, to, subject, SenderMessage) {
             replyMessage = completion.choices[0].message.content;
         }
         else {
-            replyMessage = "Thank you for your message. I am unavailable right now, but will respond as soon as possible...";
+            replyMessage =
+                "Thank you for your message. I am unavailable right now, but will respond as soon as possible...";
         }
         console.log(replyMessage);
-        const emailContent = `From: ${from}\nTo: ${to}\nSubject: ${subject}\n\n ${replyMessage} `;
+        const emailContent = `From: ${from}\nTo: ${to}\nSubject: Re: ${subject}\nIn-Reply-To: ${messageId}\nReferences: ${messageId}\n\n${replyMessage}`;
         const base64EncodedEmail = Buffer.from(emailContent)
             .toString("base64")
             .replace(/\+/g, "-")
-            .replace(/\//g, "_");
+            .replace(/\//g, "_")
+            .replace(/=+$/, "");
         return base64EncodedEmail;
     });
 }
@@ -152,14 +207,14 @@ function checkEmailsAndSendReplies() {
                     const from = (_c = (_b = (_a = email.payload) === null || _a === void 0 ? void 0 : _a.headers) === null || _b === void 0 ? void 0 : _b.find((header) => header.name === "From")) === null || _c === void 0 ? void 0 : _c.value;
                     const toEmail = (_f = (_e = (_d = email.payload) === null || _d === void 0 ? void 0 : _d.headers) === null || _e === void 0 ? void 0 : _e.find((header) => header.name === "To")) === null || _f === void 0 ? void 0 : _f.value;
                     const subject = (_j = (_h = (_g = email.payload) === null || _g === void 0 ? void 0 : _g.headers) === null || _h === void 0 ? void 0 : _h.find((header) => header.name === "Subject")) === null || _j === void 0 ? void 0 : _j.value;
-                    const messageTEXT = (_o = (_m = (_l = (_k = email.payload) === null || _k === void 0 ? void 0 : _k.parts) === null || _l === void 0 ? void 0 : _l[0]) === null || _m === void 0 ? void 0 : _m.body) === null || _o === void 0 ? void 0 : _o.data;
+                    const messageText = (_o = (_m = (_l = (_k = email.payload) === null || _k === void 0 ? void 0 : _k.parts) === null || _l === void 0 ? void 0 : _l[0]) === null || _m === void 0 ? void 0 : _m.body) === null || _o === void 0 ? void 0 : _o.data;
                     if (!from || !toEmail || !subject) {
                         continue;
                     }
                     if (repliedMessages.has(message.id)) {
                         continue;
                     }
-                    if (!messageTEXT) {
+                    if (!messageText) {
                         continue;
                     }
                     const thread = yield gmail.users.threads.get({
@@ -168,38 +223,16 @@ function checkEmailsAndSendReplies() {
                     });
                     const replies = thread.data.messages.slice(1);
                     if (replies.length === 0) {
-                        yield gmail.users.messages.send({
-                            userId: "me",
-                            requestBody: {
-                                raw: yield createReplyRaw(toEmail, from, subject, messageTEXT),
-                            },
-                        });
-                        console.log("sending reply to " + from);
-                        const label1 = "Interested";
-                        const labe2 = "Not Interested";
-                        const label3 = "More Information";
-                        const completion = yield openai.chat.completions.create({
-                            messages: [
-                                {
-                                    role: "system",
-                                    content: `${messageTEXT} This is an email that I received, analyze this email content and assign a label to it out of these 3 : {Interested,Not Interested,More Information} , return only one of these as reply and nothing other than this`,
-                                },
-                            ],
-                            model: "gpt-3.5-turbo",
-                        });
-                        console.log(completion.choices[0].message.content);
-                        const label = completion.choices[0].message.content;
-                        const labelId = yield createLabelIfNeeded(label || "Label");
-                        if (labelId) {
-                            yield gmail.users.messages.modify({
-                                userId: "me",
-                                id: message.id,
-                                requestBody: {
-                                    addLabelIds: [labelId],
-                                },
-                            });
-                        }
-                        repliedMessages.add(message.id);
+                        const emaildata = {
+                            toEmail: toEmail,
+                            from: from,
+                            subject: subject,
+                            messageText: messageText,
+                            messageId: message.id,
+                            gmail: gmail,
+                        };
+                        console.log("adding data to queue" + from);
+                        yield myQueue.add("SendMessage", { emaildata: emaildata });
                     }
                 }
             }
@@ -233,14 +266,14 @@ app.get("/emails", (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                 }
             });
             const messageHTML = (_f = (_e = (_d = (_c = emailDetails.payload) === null || _c === void 0 ? void 0 : _c.parts) === null || _d === void 0 ? void 0 : _d[1]) === null || _e === void 0 ? void 0 : _e.body) === null || _f === void 0 ? void 0 : _f.data;
-            const messageTEXT = (_k = (_j = (_h = (_g = emailDetails.payload) === null || _g === void 0 ? void 0 : _g.parts) === null || _h === void 0 ? void 0 : _h[0]) === null || _j === void 0 ? void 0 : _j.body) === null || _k === void 0 ? void 0 : _k.data;
+            const messageText = (_k = (_j = (_h = (_g = emailDetails.payload) === null || _g === void 0 ? void 0 : _g.parts) === null || _h === void 0 ? void 0 : _h[0]) === null || _j === void 0 ? void 0 : _j.body) === null || _k === void 0 ? void 0 : _k.data;
             const email = {
                 id: emailDetails.id,
                 sender: sender || "unknown sender",
                 subject: subject || "No Subject",
                 date: date || "",
                 messageHTML: (messageHTML && decodeBase64(messageHTML)) || "No Message",
-                messageTEXT: (messageTEXT && decodeBase64(messageTEXT)) || "No Message",
+                messageText: (messageText && decodeBase64(messageText)) || "No Message",
             };
             return email;
         }));
